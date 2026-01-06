@@ -456,11 +456,32 @@ func (rf *Raft) broadcastAppendEntries() {
 				if reply.Success {
 					rf.nextIndex[i] = len(rf.log)
 					rf.matchIndex[i] = len(rf.log) - 1
+					rf.updateCommitIndex()
 				} else {
 					rf.nextIndex[i]--
 				}
 			}
 		}(i)
+	}
+}
+
+func (rf *Raft) updateCommitIndex() {
+	for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
+		if rf.log[N].Term != rf.currentTerm {
+			continue
+		}
+
+		count := 1 // leader
+		for i := range rf.peers {
+			if i != rf.me && rf.matchIndex[i] >= N {
+				count++
+			}
+		}
+
+		if count > len(rf.peers)/2 {
+			rf.commitIndex = N
+			return
+		}
 	}
 }
 
