@@ -18,13 +18,13 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -99,14 +99,12 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	rf.persister.Save(w.Bytes(), nil)
 }
 
 // restore previously persisted state.
@@ -114,19 +112,14 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.log)
+
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 }
 
 // the service says it has created a snapshot that has
@@ -135,7 +128,6 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
 }
 
 // example RequestVote RPC arguments structure.
@@ -170,6 +162,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.state = Follower
+		rf.persist()
 	}
 
 	lastIndex := len(rf.log) - 1
@@ -182,38 +175,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.electionReset = time.Now()
+		rf.persist()
 	}
 
 	reply.Term = rf.currentTerm
 }
 
 // example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
@@ -236,33 +204,28 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
 	reply.Term = rf.currentTerm
 	reply.Success = false
-
 	if args.Term < rf.currentTerm {
 		return
 	}
-
 	rf.electionReset = time.Now()
-
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 	}
-
 	rf.state = Follower
-
 	if args.PrevLogIndex >= len(rf.log) ||
 		rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		return
 	}
-
 	rf.log = rf.log[:args.PrevLogIndex+1]
 	rf.log = append(rf.log, args.Entries...)
-
+	rf.persist()
+	lastNewIndex := args.PrevLogIndex + len(args.Entries)
 	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+		rf.commitIndex = min(args.LeaderCommit, lastNewIndex)
 	}
 
 	reply.Success = true
@@ -272,18 +235,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return rf.peers[server].Call("Raft.AppendEntries", args, reply)
 }
 
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election. even if the Raft instance has been killed,
-// this function should return gracefully.
-//
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
+// the service using Raft wants to start agreement on the next command
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -292,25 +244,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, rf.currentTerm, false
 	}
 
-	entry := LogEntry{Term: rf.currentTerm, Command: command}
-	rf.log = append(rf.log, entry)
-	index := len(rf.log) - 1
+	rf.log = append(rf.log, LogEntry{
+		Term:    rf.currentTerm,
+		Command: command,
+	})
+	rf.persist()
 
+	index := len(rf.log) - 1
 	return index, rf.currentTerm, true
 }
 
-// the tester doesn't halt goroutines created by Raft after each test,
-// but it does call the Kill() method. your code can use killed() to
-// check whether Kill() has been called. the use of atomic avoids the
-// need for a lock.
-//
-// the issue is that long-running goroutines use memory and may chew
-// up CPU time, perhaps causing later tests to fail and generating
-// confusing debug output. any goroutine with a long-running loop
-// should call killed() to check whether it should stop.
+// the tester doesn't halt goroutines created by Raft after each test
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
 }
 
 func (rf *Raft) killed() bool {
@@ -336,6 +282,7 @@ func (rf *Raft) startElection() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.electionReset = time.Now()
+	rf.persist()
 
 	votes := 1
 	term := rf.currentTerm
@@ -368,6 +315,7 @@ func (rf *Raft) startElection() {
 					rf.currentTerm = reply.Term
 					rf.state = Follower
 					rf.votedFor = -1
+					rf.persist()
 					return
 				}
 
@@ -450,6 +398,7 @@ func (rf *Raft) broadcastAppendEntries() {
 					rf.currentTerm = reply.Term
 					rf.state = Follower
 					rf.votedFor = -1
+					rf.persist()
 					return
 				}
 
@@ -471,7 +420,7 @@ func (rf *Raft) updateCommitIndex() {
 			continue
 		}
 
-		count := 1 // leader
+		count := 1
 		for i := range rf.peers {
 			if i != rf.me && rf.matchIndex[i] >= N {
 				count++
@@ -480,40 +429,33 @@ func (rf *Raft) updateCommitIndex() {
 
 		if count > len(rf.peers)/2 {
 			rf.commitIndex = N
+			rf.persist()
 			return
 		}
 	}
 }
 
-// the service or tester wants to create a Raft server. the ports
-// of all the Raft servers (including this one) are in peers[]. this
-// server's port is peers[me]. all the servers' peers[] arrays
-// have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
-// tester or service expects Raft to send ApplyMsg messages.
-// Make() must return quickly, so it should start goroutines
-// for any long-running work.
+// the service or tester wants to create a Raft server.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	// Your initialization code here (2A, 2B, 2C).
+
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 	rf.applyCh = applyCh
-
 	rf.state = Follower
 	rf.votedFor = -1
 	rf.log = []LogEntry{{Term: 0}}
 	rf.electionReset = time.Now()
 
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+
 	go rf.ticker()
 	go rf.applier()
 
 	return rf
-	// initialize from state persisted before a crash
-	//rf.readPersist(persister.ReadRaftState())
 }
 
 func min(a, b int) int {
